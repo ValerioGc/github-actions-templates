@@ -1,0 +1,210 @@
+
+# GitHub Actions workflow for managing versioning and releases.
+# This workflow includes steps for checking the version, extracting the changelog, from the CHANGELOG.txt file,
+# creating a release using the version and the changelog information from the previous job,  
+# and rolling back the previous step if there is a failure in the pipeline.
+name: versioning_actions
+
+on:
+    push:
+        branches: ['deploy-branch'] # Change this to the branch you want to deploy to
+
+jobs:
+
+    # This job will read the version from the package.json file to use it in the release
+    # If the tag exists, it will bump the version by incrementing the patch number,
+    # update package.json, commit and push the version bump change.
+    check-deploy-version:
+        runs-on: ubuntu-latest
+        outputs:
+            version: ${{ steps.get_updated_version.outputs.version }}
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to
+
+            - name: Install jq
+              run: sudo apt-get install -y jq
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'Starter BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            # This step will read the version from the package.json file
+            - name: Get initial version from package.json
+              id: get_initial_version
+              run: |
+                  VERSION=$(jq -r .version package.json)
+                  echo "initial_version=$VERSION" >> $GITHUB_OUTPUT
+
+            # This step will check if the version tag already exists in the repository 
+            # If the tag already exists, it will bump the version by incrementing the patch number,
+            # update package.json, commit and push the version bump change.
+            - name: Check for existing version tag and bump if exists
+              id: check_version_tag
+              run: |
+                  CURRENT_VERSION=$(jq -r .version package.json)
+                  TAG="PRODUCTION_V_${CURRENT_VERSION}"
+                  if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+                    echo "Version $TAG already exists. Bumping version."
+                    IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
+                    NEW_PATCH=$((patch + 1))
+                    NEW_VERSION="$major.$minor.$NEW_PATCH"
+                    echo "New version: $NEW_VERSION"
+                    jq --arg newVersion "$NEW_VERSION" '.version = $newVersion' package.json > package.tmp && mv package.tmp package.json
+                    git add package.json
+                    git commit -m "Bump version from $CURRENT_VERSION to $NEW_VERSION"
+                    git push origin deploy-branch # Change this to the branch you want to deploy to
+                  fi
+
+            # Update the output with the new version
+            - name: Get updated version from package.json
+              id: get_updated_version
+              run: |
+                  UPDATED_VERSION=$(jq -r .version package.json)
+                  echo "version=$UPDATED_VERSION" >> $GITHUB_OUTPUT
+
+
+    # This job will create a release and tag with the version and changelog information from the previous job
+    create-release:
+        if: success()
+        runs-on: ubuntu-latest
+        needs: [check-deploy-version, build-and-test, deploy-production]
+        outputs:
+            create_release_outcome: ${{ steps.create_release.outcome }}
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'Release BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            # This step will read the content of CHANGELOG.txt
+            # If the file does not exist or is empty, it will set a default message
+            # The content will be used in the release body
+            - name: Get content of CHANGELOG.txt
+              id: get_changelog
+              run: |
+                  echo "Checking if CHANGELOG.txt exists..."
+                  if [ -f CHANGELOG.txt ]; then
+                    echo "CHANGELOG.txt found."
+                    echo "Debug: file content is:" 
+                    cat CHANGELOG.txt  # Echo the content of the file
+                    echo "Debug: file size (in bytes):" # Echo the size of the file
+                    wc -c CHANGELOG.txt
+                    if [ -s CHANGELOG.txt ]; then
+                      CHANGELOG=$(cat CHANGELOG.txt) 
+                      echo "CHANGELOG.txt content found."
+                    else
+                      echo "CHANGELOG.txt is empty."
+                      CHANGELOG="<p><b>General bugfix</b> and <b>optimization</b>.</p>"
+                    fi
+                  else
+                    echo "CHANGELOG.txt not found."
+                    CHANGELOG="No changelog available."
+                  fi
+                  # Set the output in multiline mode to handle special characters
+                  echo "changelog<<EOF" >> $GITHUB_OUTPUT
+                  echo "$CHANGELOG" >> $GITHUB_OUTPUT
+                  echo "EOF" >> $GITHUB_OUTPUT
+
+            # This step will create a release and tag with format tag name "PRODUCTION_V_<version>" with the version and changelog information
+            # The release will be created with the version from the check-deploy-version job and the changelog from the CHANGELOG file
+            # The process use the GitHub API and requires the permission to write and read in repository settings
+            - name: Create GitHub Release
+              id: create_release
+              if: success()
+              uses: actions/create-release@v1
+              with:
+                  tag_name: 'PRODUCTION_V_${{ needs.check-deploy-version.outputs.version }}'
+                  release_name: 'Release PRODUCTION_V_${{ needs.check-deploy-version.outputs.version }}'
+                  body: |
+                      <img src="image/logo url" alt="logo" align="center" width="180" height="100" />
+                      <h2>Changelog Version: ${{ needs.check-deploy-version.outputs.version }}</h2>
+                      Changes in this release: 
+                      <br/>
+                      <br/>
+
+                      ${{ steps.get_changelog.outputs.changelog }}
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # You can replace this with your own personal access token
+
+            # This step empties the CHANGELOG.txt file after the release is created
+            - name: Empty CHANGELOG.txt
+              id: empty_changelog
+              run: |
+                  if [ -f CHANGELOG.txt ]; then
+                    echo -n "" > CHANGELOG.txt
+                    git add CHANGELOG.txt
+                    if git diff --staged --quiet; then
+                      echo "No changes to commit"
+                    else
+                      git commit -m "Empty CHANGELOG after release"
+                      git push origin deploy-branch # Change this to the branch you want to deploy to
+                    fi
+                  fi
+
+
+    # This job will rollback the deployment by deleting the release and removing the tag
+    rollback-all:
+        if: failure()
+        runs-on: ubuntu-latest
+        needs:
+            [
+                check-deploy-version,
+                create-release,
+            ]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Rollback)
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to
+
+            - name: Setup Node.js for Rollback
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Configure Git for Rollback
+              run: |
+                  git config --global user.name "GitHub Actions"
+                  git config --global user.email "actions@github.com"
+
+            # This step will delete the release and tag created in the create-release job if the deployment fails
+            # The process uses the GitHub API and requires the permission to write and read in repository settings
+            - name: Reset Release and Tag
+              if: needs.create-release.outputs.create_release_outcome == 'success'
+              continue-on-error: true
+              env:
+                  PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+                  VERSION: ${{ needs.check-deploy-version.outputs.version }}
+              run: |
+                  TAG_TO_DELETE="PRODUCTION_V_${VERSION}"
+                  RELEASE=$(curl --silent -H "Authorization: Bearer $PERSONAL_ACCESS_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$TAG_TO_DELETE")
+                  if [ "$(echo $RELEASE | jq -r .message)" != "Not Found" ]; then
+                    RELEASE_ID=$(echo $RELEASE | jq -r .id)
+                    echo "Found release with ID: $RELEASE_ID"
+                    curl -X DELETE -H "Authorization: Bearer $PERSONAL_ACCESS_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID"
+                  else
+                    echo "Release not found for tag: $TAG_TO_DELETE"
+                  fi
+                  git fetch --tags
+                  if git rev-parse $TAG_TO_DELETE >/dev/null 2>&1; then
+                    git tag -d $TAG_TO_DELETE
+                    git push origin :refs/tags/$TAG_TO_DELETE
+                  else
+                    echo "Tag not found: $TAG_TO_DELETE"
+                  fi

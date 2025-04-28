@@ -1,0 +1,219 @@
+
+
+# This workflow it's an example of utilizing the fe_actions_utils.yaml 
+# in a CI/CD pipeline for deploying a frontend application in a test environment.
+#
+name: TEST_CI_deploy_pipeline
+
+on:
+    push:
+        branches: ['deploy_test']
+
+jobs:
+
+    # This job will build the project and run the unit tests
+    # It will output the results of the build and test steps
+    build-and-test:
+        runs-on: ubuntu-latest
+        if: success()
+        outputs:
+            check_build: ${{ steps.build_project.outcome }}
+            check_tests: ${{ steps.test_project.outcome }}
+            push_changes: ${{ steps.push_changes.outcome }}
+        strategy:
+            matrix:
+                node-version: [20.x]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy_test
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: ${{ matrix.node-version }}
+                  cache: 'npm'
+
+            - name: Install dependencies (CI)
+              run: npm ci
+
+            # Replace the .env.production file with the .env.test file
+            # This is done to ensure that the production environment is not affected by the tests
+            - name: Replace .env.production with .env.test
+              run: |
+                  rm -f .env.production
+                  cp .env.test .env.production
+
+            - name: Delete contents of dist folder
+              run: rm -rf dist/*
+
+            - name: Clean npm cache and node_modules
+              run: |
+                  rm -rf node_modules
+                  rm -f package-lock.json
+                  npm cache clean --force
+                  npm install
+
+            # Run the unit tests with npm test (vitest)
+            - name: Run Unit Tests
+              id: test_project
+              run: npm run test:unit
+
+            - name: Build Project
+              id: build_project
+              run: npm run build:test
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'GitHub Actions'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Update Compiled Files
+              id: update_build
+              run: |
+                  git add dist
+                  if ! git diff --cached --quiet; then
+                    git commit -m "Automatic update compiled files in dist"
+                  else
+                    echo "No changes to commit"
+                  fi
+
+            - name: Push Changes
+              id: push_changes
+              if: steps.update_build.conclusion == 'success'
+              run: git push origin HEAD:deploy_test
+
+    # Deploy the project to the test environment
+    # This job will only run if the build and test jobs are successful
+    # It will merge the deploy_test branch into the test branch and deploy the changes
+    deploy-test:
+        if: success()
+        runs-on: ubuntu-latest
+        needs: build-and-test
+        outputs:
+            deploy_result: ${{ steps.deploy_test.outcome }}
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy_test
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Install dependencies (CI)
+              run: npm ci
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'GitHub Actions'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Backup test version
+              run: |
+                  git fetch origin
+                  git checkout test
+                  git checkout -b temp
+                  git push origin temp
+
+            - name: Merge Deploy into Test branch
+              run: |
+                  git fetch origin
+                  git checkout test
+                  git reset --hard origin/test
+                  git merge --allow-unrelated-histories --strategy-option=ours deploy_test
+
+            - name: Clean unnecessary files and move build
+              run: |
+                  git clean -fdx -e .git -e dist
+                  find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name 'dist' -exec rm -rf {} +
+                  mv dist/* .
+                  rm -rf dist
+
+            - name: Commit and Push Changes to Test
+              id: deploy_test
+              run: |
+                  git add .
+                  git commit -m "Auto Deploy from deploy_test branch" || echo "No changes to commit"
+                  git push origin HEAD:test
+
+    rollback-all:
+        if: failure()
+        runs-on: ubuntu-latest
+        needs: [build-and-test, deploy-test]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Rollback)
+              with:
+                  ref: deploy_test
+
+            - name: Setup Node.js for Rollback
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Configure Git for Rollback
+              run: |
+                  git config --global user.name "GitHub Actions"
+                  git config --global user.email "actions@github.com"
+
+            - name: Restore Test from Temp (Rollback Test)
+              if: needs.deploy-test.outputs.deploy_result == 'success'
+              run: |
+                  git fetch origin
+                  git checkout test
+                  git reset --hard origin/temp
+                  git push origin test --force
+
+            - name: Reset Deploy Branch (Rollback Deploy)
+              run: |
+                  git fetch origin
+                  git checkout deploy_test
+                  git reset --hard HEAD~1
+                  git push origin deploy_test --force
+
+    # Cleanup workspace after pipeline execution is completed
+    # This job will run always, even if previous jobs failed
+    # It will remove temporary files and branches created during pipeline execution
+    cleanup-workspace:
+        runs-on: ubuntu-latest
+        needs: [rollback-all]
+        if: always()
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Cleanup)
+              with:
+                  ref: deploy_test
+
+            - name: Setup Node.js for Cleanup
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Install dependencies (CI) for Cleanup
+              run: npm ci
+
+            - name: Configure Git for Cleanup
+              run: |
+                  git config --global user.name 'Cleanup BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Remove local and remote temp branch
+              run: |
+                  git fetch --all
+                  if git branch --all | grep -q "remotes/origin/temp"; then
+                    git push origin --delete temp
+                  else
+                    echo "No remote temp branch to clean up"
+                  fi
+                  if git branch | grep -q "temp"; then
+                    git branch -D temp
+                  else
+                    echo "No local temp branch to clean up"
+                  fi

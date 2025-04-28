@@ -1,0 +1,391 @@
+
+# This workflow it's an example of utilizing the fe_actions_utils.yaml and versioning_actions.yaml 
+# in a CI/CD pipeline for deploying a frontend application in a production environment such as a static hosting.
+# It includes steps for checking out the code, setting up Node.js, installing dependencies, running tests,
+# building the project, and deploying the changes to a production branch.
+# It will also create a GitHub release with the version and changelog information extracted in the previous tests.
+# It also includes a rollback process in case of failure that reverts the changes made to the deploy_prod branch.
+#
+name: PROD_CI_deploy_pipeline
+
+on:
+    push:
+        branches: ['deploy_prod']
+
+jobs:
+
+    # This job will read the version from the package.json file
+    # It will check if the version tag already exists
+    # If the tag exists, it will bump the version by incrementing the patch number,
+    # update package.json, commit and push the version bump change.
+    check-deploy-version:
+        runs-on: ubuntu-latest
+        outputs:
+            version: ${{ steps.get_updated_version.outputs.version }}
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy_prod
+
+            - name: Install jq
+              run: sudo apt-get install -y jq
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'Starter BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Get initial version from package.json
+              id: get_initial_version
+              run: |
+                  VERSION=$(jq -r .version package.json)
+                  echo "initial_version=$VERSION" >> $GITHUB_OUTPUT
+
+            - name: Check for existing version tag and bump if exists
+              id: check_version_tag
+              run: |
+                  CURRENT_VERSION=$(jq -r .version package.json)
+                  TAG="PRODUCTION_V_${CURRENT_VERSION}"
+                  if git ls-remote --tags origin | grep -q "refs/tags/$TAG"; then
+                    echo "Version $TAG already exists. Bumping version."
+                    IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
+                    NEW_PATCH=$((patch + 1))
+                    NEW_VERSION="$major.$minor.$NEW_PATCH"
+                    echo "New version: $NEW_VERSION"
+                    jq --arg newVersion "$NEW_VERSION" '.version = $newVersion' package.json > package.tmp && mv package.tmp package.json
+                    git add package.json
+                    git commit -m "Bump version from $CURRENT_VERSION to $NEW_VERSION"
+                    git push origin deploy_prod
+                  fi
+
+            - name: Get updated version from package.json
+              id: get_updated_version
+              run: |
+                  UPDATED_VERSION=$(jq -r .version package.json)
+                  echo "version=$UPDATED_VERSION" >> $GITHUB_OUTPUT
+
+    # This job will build the project and run the unit tests
+    # It will output the results of the build and test steps
+    build-and-test:
+        runs-on: ubuntu-latest
+        if: success()
+        needs: check-deploy-version
+        outputs:
+            check_build: ${{ steps.build_project.outcome }}
+            check_tests: ${{ steps.test_project.outcome }}
+            push_changes: ${{ steps.push_changes.outcome }}
+        strategy:
+            matrix:
+                node-version: [20.x]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy_prod
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: ${{ matrix.node-version }}
+                  cache: 'npm'
+
+            - name: Install dependencies (CI)
+              run: npm ci
+
+            - name: Run Unit Tests
+              id: test_project
+              run: npm run test:unit
+
+            - name: Build Project
+              id: build_project
+              run: npm run build:prod
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'GitHub Actions'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Update Compiled Files
+              id: update_build
+              run: |
+                  git add dist
+                  if ! git diff --cached --quiet; then
+                    git commit -m "Automatic update compiled files in dist"
+                  else
+                    echo "No changes to commit"
+                  fi
+
+            - name: Push Changes
+              id: push_changes
+              if: steps.update_build.conclusion == 'success'
+              run: git push origin HEAD:deploy_prod
+
+    # This job will merge the deploy_prod branch into the prod branch and deploy the changes
+    deploy-production:
+        if: success()
+        runs-on: ubuntu-latest
+        needs: build-and-test
+        outputs:
+            deploy_result: ${{ steps.deploy_prod.outcome }}
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy_prod
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Install dependencies (CI)
+              run: npm ci
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'GitHub Actions'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Backup production version
+              run: |
+                  git fetch origin
+                  git checkout prod || git checkout -b prod
+                  git pull origin prod 
+                  git checkout -b temp 
+                  git push origin temp
+
+            - name: Merge Deploy into Prod
+              run: |
+                  git fetch origin
+                  git checkout prod
+                  git reset --hard origin/prod
+                  git merge --no-ff --allow-unrelated-histories --strategy-option=ours deploy_prod
+
+            - name: Clean unnecessary files and move build
+              run: |
+                  git clean -fdx -e .git -e dist
+                  find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name 'dist' -exec rm -rf {} +
+                  mv dist/* .
+                  rm -rf dist
+
+            - name: Commit and Push Changes to Prod
+              id: deploy_prod
+              run: |
+                  git add .
+                  git commit -m "Auto Deploy from deploy_prod branch" || echo "No changes to commit"
+                  git push origin HEAD:prod
+
+    # This job will create a github release and a tag with the version and changelog information
+    create-release:
+        if: success()
+        runs-on: ubuntu-latest
+        needs: [check-deploy-version, build-and-test, deploy-production]
+        outputs:
+            create_release_outcome: ${{ steps.create_release.outcome }}
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy_prod
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'Release BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Get content of CHANGELOG.txt
+              id: get_changelog
+              run: |
+                  echo "Checking if CHANGELOG.txt exists..."
+                  if [ -f CHANGELOG.txt ]; then
+                    echo "CHANGELOG.txt found."
+                    echo "Debug: file content is:"
+                    cat CHANGELOG.txt
+                    echo "Debug: file size (in bytes):"
+                    wc -c CHANGELOG.txt
+                    if [ -s CHANGELOG.txt ]; then
+                      CHANGELOG=$(cat CHANGELOG.txt)
+                      echo "CHANGELOG.txt content found."
+                    else
+                      echo "CHANGELOG.txt is empty."
+                      CHANGELOG="<p><b>General bugfix</b> and <b>optimization</b>.</p>"
+                    fi
+                  else
+                    echo "CHANGELOG.txt not found."
+                    CHANGELOG="No changelog available."
+                  fi
+                  echo "changelog<<EOF" >> $GITHUB_OUTPUT
+                  echo "$CHANGELOG" >> $GITHUB_OUTPUT
+                  echo "EOF" >> $GITHUB_OUTPUT
+
+            - name: Create GitHub Release
+              id: create_release
+              if: success()
+              uses: actions/create-release@v1
+              with:
+                  tag_name: 'PRODUCTION_V_${{ needs.check-deploy-version.outputs.version }}'
+                  release_name: 'Release PRODUCTION_V_${{ needs.check-deploy-version.outputs.version }}'
+                  body: |
+                      <img src="{logo url/path}" alt="logo" align="center" width="180" height="100" />
+                      <h2>Changelog Version: ${{ needs.check-deploy-version.outputs.version }}</h2>
+                      Changes in this release: 
+                      <br/>
+                      <br/>
+
+                      ${{ steps.get_changelog.outputs.changelog }}
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Empty CHANGELOG.txt
+              id: empty_changelog
+              run: |
+                  if [ -f CHANGELOG.txt ]; then
+                    echo -n "" > CHANGELOG.txt
+                    git add CHANGELOG.txt
+                    if git diff --staged --quiet; then
+                      echo "No changes to commit"
+                    else
+                      git commit -m "Empty CHANGELOG after release"
+                      git push origin deploy_prod
+                    fi
+                  fi
+
+    # This job will rollback the deployment by deleting the release and removing the tag
+    # It will also restore the prod branch from the temp branch and reset the deploy branch
+    rollback-all:
+        if: failure()
+        runs-on: ubuntu-latest
+        needs:
+            [
+                check-deploy-version,
+                build-and-test,
+                deploy-production,
+                create-release,
+            ]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Rollback)
+              with:
+                  ref: deploy_prod
+
+            - name: Setup Node.js for Rollback
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Configure Git for Rollback
+              run: |
+                  git config --global user.name "GitHub Actions"
+                  git config --global user.email "actions@github.com"
+
+            # Rollback Release and Tag: Delete release and remove tag if created
+            - name: Reset Release and Tag
+              if: needs.create-release.outputs.create_release_outcome == 'success'
+              continue-on-error: true
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ needs.check-deploy-version.outputs.version }}
+              run: |
+                  TAG_TO_DELETE="PRODUCTION_V_${VERSION}"
+                  RELEASE=$(curl --silent -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$TAG_TO_DELETE")
+                  if [ "$(echo $RELEASE | jq -r .message)" != "Not Found" ]; then
+                    RELEASE_ID=$(echo $RELEASE | jq -r .id)
+                    echo "Found release with ID: $RELEASE_ID"
+                    curl -X DELETE -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID"
+                  else
+                    echo "Release not found for tag: $TAG_TO_DELETE"
+                  fi
+                  git fetch --tags
+                  if git rev-parse $TAG_TO_DELETE >/dev/null 2>&1; then
+                    git tag -d $TAG_TO_DELETE
+                    git push origin :refs/tags/$TAG_TO_DELETE
+                  else
+                    echo "Tag not found: $TAG_TO_DELETE"
+                  fi
+
+            # Restore Prod from Temp
+            - name: Restore Prod from Temp (Rollback Prod)
+              if: needs.deploy-production.outputs.deploy_result == 'success'
+              run: |
+                  git fetch origin
+                  git checkout prod
+                  git reset --hard origin/temp
+                  git push origin prod --force
+
+            # Reset Deploy Branch
+            - name: Reset Deploy Branch (Rollback Deploy)
+              run: |
+                  git fetch origin
+                  git checkout deploy_prod
+                  git reset --hard HEAD~1
+                  git push origin deploy_prod --force
+
+    # Cleanup workspace after pipeline execution is completed
+    # This job will run always, even if previous jobs failed
+    # It will remove temporary files and branches created during pipeline execution
+    cleanup-workspace:
+        runs-on: ubuntu-latest
+        needs: [rollback-all]
+        if: always()
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Cleanup)
+              with:
+                  ref: deploy_prod
+
+            - name: Setup Node.js for Cleanup
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Install dependencies (CI) for Cleanup
+              run: npm ci
+
+            - name: Configure Git for Cleanup
+              run: |
+                  git config --global user.name 'Cleanup BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            - name: Remove local and remote temp branch
+              run: |
+                  git fetch --all
+                  if git branch --all | grep -q "remotes/origin/temp"; then
+                    git push origin --delete temp
+                  else
+                    echo "No remote temp branch to clean up"
+                  fi
+                  if git branch | grep -q "temp"; then
+                    git branch -D temp
+                  else
+                    echo "No local temp branch to clean up"
+                  fi
+
+            - name: Checkout branch dev
+              run: |
+                  git fetch origin
+                  git checkout dev
+                  git pull origin dev
+
+            - name: Empty CHANGELOG.txt
+              id: empty_changelog
+              run: |
+                  if [ -f CHANGELOG.txt ]; then
+                    echo -n "" > CHANGELOG.txt
+                    git add CHANGELOG.txt
+                    if git diff --staged --quiet; then
+                      echo "No changes to commit"
+                    else
+                      git commit -m "Empty CHANGELOG after release"
+                      git push origin dev
+                    fi
+                  fi

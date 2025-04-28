@@ -1,0 +1,227 @@
+
+
+# Github Workflow for Front end SPA based on Node.js and Vite (Vue.js, React, etc..)
+# This workflow is designed to build and test the project, and push the compiled build to a specific branch
+# It includes steps for checking out the code, setting up Node.js, installing dependencies, running tests,
+# and building the project. It include a rollback process in case of failure that reverts the changes made to the {deploy-branch}
+name: fe_actions_utils
+
+on:
+    push:
+        branches: ['deploy-branch']  # Change this to the branch you want to deploy to
+
+jobs:
+
+    # Test and build the project
+    build-and-test:
+        runs-on: ubuntu-latest
+        if: success()
+        needs: check-deploy-version
+        outputs:
+            check_build: ${{ steps.build_project.outcome }} # Check if the build was successful
+            check_tests: ${{ steps.test_project.outcome }} # Check if the tests were successful
+            push_changes: ${{ steps.push_changes.outcome }} # Check if the push was successful
+        strategy:
+            matrix:
+                node-version: [20.x]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: ${{ matrix.node-version }}
+                  cache: 'npm'
+
+            - name: Install dependencies (CI)
+              run: npm ci
+
+            # Test the project with npm test (vitest). Replace with your test command.
+            - name: Run Unit Tests
+              id: test_project
+              run: npm run test:unit
+
+            # Build the compiled files in the dist folder. Replace with your build command
+            - name: Build Project
+              id: build_project
+              run: npm run build:prod
+
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'GitHub Actions'
+                  git config --global user.email 'actions@github.com'
+
+            # Update the compiled files in the dist folder and commit the changes if there are any
+            - name: Update Compiled Files
+              id: update_build
+              run: |
+                  git add dist
+                  if ! git diff --cached --quiet; then
+                    git commit -m "Automatic update compiled files in dist"
+                  else
+                    echo "No changes to commit"
+                  fi
+
+            # Push changes to the {deploy-branch}
+            - name: Push Changes
+              id: push_changes
+              if: steps.update_build.conclusion == 'success'
+              run: git push origin HEAD:deploy-branch
+
+
+    # This job will merge the {deploy-branch} branch into the {prod} branch and deploy the changes.
+    # Change the branch names according to your needs and branch structure
+    deploy-production:
+        if: success()
+        runs-on: ubuntu-latest
+        needs: build-and-test
+        outputs:
+            deploy_result: ${{ steps.deploy-branch.outcome }} # Output the result of the deployment
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Install dependencies (CI)
+              run: npm ci
+
+            - name: Configure Git
+              run: |
+                  git config --global user.name 'GitHub Actions'
+                  git config --global user.email 'actions@github.com'
+
+
+            # This step will create a backup of the production branch called temp
+            - name: Backup production version
+              run: |
+                  git fetch origin
+                  git checkout prod || git checkout -b prod
+                  git pull origin prod 
+                  git checkout -b temp 
+                  git push origin temp
+
+            # This step will merge the {deploy-branch} into the production branch
+            - name: Merge Deploy into Prod
+              run: |
+                  git fetch origin
+                  git checkout prod
+                  git reset --hard origin/prod
+                  git merge --no-ff --allow-unrelated-histories --strategy-option=ours deploy-branch
+
+            # This step will remove the other files in the root folder and move the compiled files 
+            # from dist folder to the root folder
+            - name: Clean unnecessary files and move build
+              run: |
+                  git clean -fdx -e .git -e dist
+                  find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name 'dist' -exec rm -rf {} +
+                  mv dist/* .
+                  rm -rf dist
+
+            # This step will update the {prod} branch with the changes made to the {deploy-branch}
+            - name: Commit and Push Changes to Prod
+              id: deploy-branch
+              run: |
+                  git add .
+                  git commit -m "Auto Deploy from deploy-branch branch" || echo "No changes to commit"
+                  git push origin HEAD:prod
+
+
+    # Rollback process in case of failure
+    rollback-all:
+        if: failure()
+        runs-on: ubuntu-latest
+        needs: [
+            build-and-test, 
+            deploy-production,
+        ]
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Rollback)
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to  
+
+            - name: Setup Node.js for Rollback
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Configure Git for Rollback
+              run: |
+                  git config --global user.name "GitHub Actions"
+                  git config --global user.email "actions@github.com"
+            
+            # This step will restore the prod branch using the temp branch
+            # Change the branch name to the one you use to store the compiled files
+            - name: Restore Prod from Temp (Rollback Prod)
+              if: needs.deploy-production.outputs.deploy_result == 'success'
+              run: |
+                  git fetch origin
+                  git checkout prod
+                  git reset --hard origin/temp
+                  git push origin prod --force
+
+            # This step will Rollback the changes in the dist folder made to the {deploy-branch} if the build or test fails
+            # Change the branch name to the one you use to store the compiled files
+            - name: Reset Deploy Branch (Rollback Deploy)
+              run: |
+                  git fetch origin
+                  git checkout deploy-branch # Change this to the branch you want to deploy to
+                  git reset --hard HEAD~1
+                  git push origin deploy-branch --force
+
+
+    # Cleanup workspace after pipeline execution is completed
+    # This job will run always, even if previous jobs failed
+    # It will remove temporary files and branches created during pipeline execution
+    cleanup-workspace:
+        runs-on: ubuntu-latest
+        needs: [rollback-all]
+        if: always()
+        steps:
+            - uses: actions/checkout@v4
+              name: Checkout Deploy Branch (Cleanup)
+              with:
+                  ref: deploy-branch # Change this to the branch you want to deploy to
+
+            - name: Setup Node.js for Cleanup
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20.x
+                  cache: 'npm'
+
+            - name: Install dependencies (CI) for Cleanup
+              run: npm ci
+
+            - name: Configure Git for Cleanup
+              run: |
+                  git config --global user.name 'Cleanup BOT (CI)'
+                  git config --global user.email 'actions@github.com'
+
+            # This step will remove the temp branch created during the backup process if it exists
+            - name: Remove local and remote temp branch
+              run: |
+                  git fetch --all
+                  if git branch --all | grep -q "remotes/origin/temp"; then
+                    git push origin --delete temp
+                  else
+                    echo "No remote temp branch to clean up"
+                  fi
+                  if git branch | grep -q "temp"; then
+                    git branch -D temp
+                  else
+                    echo "No local temp branch to clean up"
+                  fi
+
+
